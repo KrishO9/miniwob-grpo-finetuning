@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 
@@ -21,9 +22,13 @@ def get_path_model_checkpoints(
     experiment_name: str,
 ) -> str:
     """
-    Returns path to the cached dataset in a Modal volume.
+    Returns path to model checkpoints.
+
+    Defaults to the Modal volume path used by the original example. Set
+    MODEL_CHECKPOINT_ROOT=/kaggle/working/model_checkpoints for Kaggle.
     """
-    path = Path("/model_checkpoints") / experiment_name.replace("/", "--")
+    checkpoint_root = os.environ.get("MODEL_CHECKPOINT_ROOT", "/model_checkpoints")
+    path = Path(checkpoint_root) / experiment_name.replace("/", "--")
 
     if not path.exists():
         path.mkdir(parents=True, exist_ok=True)
