@@ -21,17 +21,6 @@ The current setup is:
   - shaped reward for sparse MiniWoB tasks,
   - W&B grouping/tagging support.
 
-## Project Files
-
-- [plan.md](/D:/ML/RL/browser-control/plan.md)
-  Accuracy roadmap, bottlenecks, model roadmap, and go/no-go gates.
-
-- [experiments.md](/D:/ML/RL/browser-control/experiments.md)
-  Experiment tracker, current queue, run IDs, and config progression.
-
-- [GRPO_TRAINING_FLOW.md](/D:/ML/RL/browser-control/GRPO_TRAINING_FLOW.md)
-  Low-level explanation of rollout collection, reward handling, and trainer flow.
-
 ## Why RL for Browser Control
 
 Browser control tasks often have multiple valid trajectories. A model can click the correct element immediately, take a longer path, or recover from a mistake. That makes pure supervised data collection expensive and incomplete.
