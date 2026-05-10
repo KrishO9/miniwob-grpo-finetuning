@@ -7,6 +7,7 @@ from pathlib import Path
 
 from datasets import Dataset
 from peft import LoraConfig
+from transformers import AutoTokenizer
 from trl import GRPOConfig
 from trl import GRPOTrainer
 import wandb
@@ -17,8 +18,9 @@ from .config import FineTuningConfig
 from .paths import get_path_model_checkpoints
 
 
-ACTION_RE = re.compile(
-    r"^(?P<name>click|noop|fill|keyboard_type|keyboard_press)\((?P<args>.*)\)$"
+ACTION_EXTRACT_RE = re.compile(
+    r"(?P<name>click|noop|fill|keyboard_type|keyboard_press)\s*\((?P<args>[^()\n]*)\)",
+    re.I,
 )
 BID_RE = re.compile(r"\[(\d+)\]")
 CLICKABLE_RE = re.compile(r"\[(\d+)\]\s+(button|link|input|textbox|combobox)", re.I)
@@ -52,16 +54,9 @@ def make_user_prompt(goal: str, step_num: int, axtree: str, error: str = "") -> 
 
 
 def parse_action(response_text: str) -> ParsedAction:
-    for raw_line in response_text.strip().split("\n"):
-        line = raw_line.strip().strip("`")
-        if not line:
-            continue
-        match = ACTION_RE.match(line)
-        if not match:
-            continue
-
-        action_name = match.group("name")
-        args = match.group("args").strip()
+    for match in ACTION_EXTRACT_RE.finditer(response_text):
+        action_name = match.group("name").lower()
+        args = match.group("args").strip().strip("`").strip()
         if action_name == "noop":
             return ParsedAction("noop()", args == "", "noop")
 
@@ -74,10 +69,10 @@ def parse_action(response_text: str) -> ParsedAction:
             return ParsedAction(f"click('{referenced_bid}')", True, "click", referenced_bid)
 
         if action_name == "fill" and referenced_bid:
-            return ParsedAction(line, True, "fill", referenced_bid)
+            return ParsedAction(f"fill('{referenced_bid}')", True, "fill", referenced_bid)
 
         if action_name in {"keyboard_type", "keyboard_press"} and args:
-            return ParsedAction(line, True, action_name)
+            return ParsedAction(f"{action_name}({args})", True, action_name)
 
     return ParsedAction("noop()", False, "noop")
 
@@ -126,12 +121,20 @@ def append_rollout_log(path: str, record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=True) + "\n")
 
 
-def build_training_prompt(config: FineTuningConfig, goal: str, axtree: str) -> str:
-    return "\n\n".join(
-        [
-            config.system_prompt.strip(),
-            make_user_prompt(goal, step_num=0, axtree=axtree, error=""),
-        ]
+def build_training_prompt(
+    config: FineTuningConfig,
+    tokenizer: AutoTokenizer,
+    goal: str,
+    axtree: str,
+) -> str:
+    messages = [
+        {"role": "system", "content": config.system_prompt.strip()},
+        {"role": "user", "content": make_user_prompt(goal, step_num=0, axtree=axtree, error="")},
+    ]
+    return tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=False,
     )
 
 
@@ -255,13 +258,14 @@ def fine_tune_impl(config: FineTuningConfig) -> None:
 
     print(f"Initializing BrowserGym client at {config.browsergym_url}")
     client = BrowserGymEnv(base_url=config.browsergym_url)
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
     initial_reset = client.reset()
     initial_observation = initial_reset.observation
     initial_goal = initial_observation.goal or config.default_goal
     initial_axtree = initial_observation.axtree_txt or ""
     print(f"Initial goal: {initial_goal}")
-    training_prompt = build_training_prompt(config, initial_goal, initial_axtree)
+    training_prompt = build_training_prompt(config, tokenizer, initial_goal, initial_axtree)
 
     dataset = Dataset.from_dict({"prompt": [training_prompt] * config.dataset_size})
     output_dir = get_path_model_checkpoints(config.wandb_experiment_name)

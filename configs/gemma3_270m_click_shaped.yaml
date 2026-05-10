@@ -33,7 +33,7 @@ per_device_train_batch_size: 1
 num_generations: 4
 generation_batch_size: 4
 max_steps: 2
-max_completion_length: 12
+max_completion_length: 24
 use_vllm: false
 vllm_mode: "colocate"
 vllm_gpu_memory_utilization: 0.05
@@ -68,6 +68,6 @@ wandb_tags:
   - "click-test"
   - "gemma3-270m"
   - "shaped-reward"
-wandb_notes: "First full MiniWoB click-test experiment with Gemma 3 270M and shaped reward."
+wandb_notes: "MiniWoB click-test run with chat-template prompting, relaxed action extraction, and shaped reward."
 logging_steps: 1
 push_to_hf: false
