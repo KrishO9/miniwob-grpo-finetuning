@@ -23,7 +23,7 @@ ACTION_RE = re.compile(
 )
 BID_RE = re.compile(r"\[(\d+)\]")
 CLICKABLE_RE = re.compile(r"\[(\d+)\]\s+(button|link|input|textbox|combobox)", re.I)
-QUOTED_BID_RE = re.compile(r"""['"](?P<bid>\d+)['"]""")
+CLICK_ARGS_RE = re.compile(r"""^\s*(?:['"]?(?P<bid>\d+)['"]?|id\s*=\s*['"]?(?P<id_bid>\d+)['"]?)\s*$""")
 
 
 @dataclass
@@ -44,30 +44,40 @@ def rollout_func(
     episode_prompt_ids: list[list[int]] = []
     episode_completion_ids: list[list[int]] = []
     episode_logprobs: list[list[float]] = []
-    completion_rewards: list[float] = []
+    shaped_rewards: list[float] = []
 
-    print(f"\n[DEBUG] rollout_func called with {len(prompts)} prompts")
+    print(
+        "\n[DEBUG] rollout_func called with "
+        f"{len(prompts)} prompts x {config.num_generations} generations"
+    )
 
     for i, prompt_text in enumerate(prompts):
-        print(f"[DEBUG] Processing prompt {i + 1}/{len(prompts)}")
-        episode = rollout_once(
-            trainer=trainer,
-            env=client,
-            tokenizer=trainer.processing_class,
-            config=config,
-            dataset_prompt=prompt_text,
-            rollout_log_path=rollout_log_path,
-        )
-        episode_prompt_ids.append(episode["prompt_ids"])
-        episode_completion_ids.append(episode["completion_ids"])
-        episode_logprobs.append(episode["logprobs"])
-        completion_rewards.append(episode["completion_reward"])
+        for generation_idx in range(config.num_generations):
+            print(
+                "[DEBUG] Processing prompt "
+                f"{i + 1}/{len(prompts)}, generation "
+                f"{generation_idx + 1}/{config.num_generations}"
+            )
+            episode = rollout_once(
+                trainer=trainer,
+                env=client,
+                tokenizer=trainer.processing_class,
+                config=config,
+                dataset_prompt=prompt_text,
+                rollout_log_path=rollout_log_path,
+                prompt_index=i,
+                generation_index=generation_idx,
+            )
+            episode_prompt_ids.append(episode["prompt_ids"])
+            episode_completion_ids.append(episode["completion_ids"])
+            episode_logprobs.append(episode["logprobs"])
+            shaped_rewards.append(episode["shaped_reward"])
 
     return {
         "prompt_ids": episode_prompt_ids,
         "completion_ids": episode_completion_ids,
         "logprobs": episode_logprobs,
-        "completion_reward": completion_rewards,
+        "shaped_reward": shaped_rewards,
     }
 
 
@@ -78,6 +88,8 @@ def rollout_once(
     config: FineTuningConfig,
     dataset_prompt: str,
     rollout_log_path: str,
+    prompt_index: int,
+    generation_index: int,
 ) -> dict[str, list]:
     from trl.experimental.openenv import generate_rollout_completions
 
@@ -143,6 +155,8 @@ def rollout_once(
         append_rollout_log(
             rollout_log_path,
             {
+                "prompt_index": prompt_index,
+                "generation_index": generation_index,
                 "goal": goal,
                 "step_num": step_num + 1,
                 "raw_completion": completion_text,
@@ -169,7 +183,7 @@ def rollout_once(
         "completion_ids": completion_ids,
         "logprobs": logprobs,
         "step_rewards": step_rewards,
-        "completion_reward": final_reward,
+        "shaped_reward": final_reward,
     }
 
 
@@ -205,8 +219,10 @@ def parse_action(response_text: str) -> ParsedAction:
         if action_name == "noop":
             return ParsedAction("noop()", args == "", "noop")
 
-        bid_match = QUOTED_BID_RE.search(args)
-        referenced_bid = bid_match.group("bid") if bid_match else None
+        bid_match = CLICK_ARGS_RE.match(args)
+        referenced_bid = None
+        if bid_match:
+            referenced_bid = bid_match.group("bid") or bid_match.group("id_bid")
 
         if action_name == "click" and referenced_bid:
             return ParsedAction(f"click('{referenced_bid}')", True, "click", referenced_bid)
@@ -273,9 +289,13 @@ def parse_action_legacy(response_text: str) -> str:
 
 
 def reward_completion(completions: list[str], **kwargs) -> list[float]:
-    rewards = kwargs.get("completion_reward") if kwargs else None
+    rewards = kwargs.get("shaped_reward") if kwargs else None
     if rewards is None:
-        return [0.0 for _ in completions]
+        keys = sorted(kwargs.keys()) if kwargs else []
+        raise RuntimeError(
+            "rollout_func did not forward shaped_reward to reward_completion. "
+            f"Available kwargs: {keys}"
+        )
     return [float(r) for r in rewards]
 
 
