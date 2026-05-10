@@ -59,8 +59,15 @@ invalid_action_penalty: -0.05
 noop_with_clickables_penalty: -0.10
 env_error_penalty: -0.10
 
-wandb_enabled: false
+wandb_enabled: true
 wandb_project_name: "browser-control-fine-tune-with-grpo"
+wandb_group: "qwen2.5-0.5b-click"
+wandb_job_type: "train"
+wandb_tags:
+  - "miniwob"
+  - "click-test"
+  - "qwen2.5-0.5b"
+  - "shaped-reward"
+wandb_notes: "MiniWoB click-test comparison run with Qwen2.5 0.5B and shaped reward."
 logging_steps: 1
 push_to_hf: false
-

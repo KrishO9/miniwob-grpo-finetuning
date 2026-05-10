@@ -42,9 +42,15 @@ class FineTuningConfig(BaseSettings):
     # experiment tracking
     wandb_enabled: bool
     wandb_project_name: str
+    wandb_entity: Optional[str] = None
     wandb_experiment_name: str | None = None
+    wandb_group: Optional[str] = None
+    wandb_job_type: str = "train"
+    wandb_tags: list[str] = []
+    wandb_notes: Optional[str] = None
     logging_steps: int                  # How often do we print out training loss?
     push_to_hf: Optional[bool] = True
+    config_file_name: Optional[str] = None
 
     # LoRA-specific hyperparameters for parameter efficient fine-tuning
     use_peft: bool = False  # Default: disabled for backward compatibility
@@ -87,6 +93,7 @@ class FineTuningConfig(BaseSettings):
             data = yaml.safe_load(f)
 
         # print('Loaded config:', data)
+        data["config_file_name"] = file_name
 
         return cls(**data)
 
@@ -98,6 +105,10 @@ class FineTuningConfig(BaseSettings):
             self.wandb_experiment_name = (
                 f"{model_short}-browsergym-{timestamp}"
             )
+
+        if self.wandb_group is None:
+            model_short = self.model_name.split("/")[-1]
+            self.wandb_group = f"{model_short}-miniwob-click"
 
         return self
     

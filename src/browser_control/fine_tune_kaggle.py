@@ -299,10 +299,16 @@ def fine_tune_impl(config: FineTuningConfig) -> None:
     os.environ.setdefault("HF_HOME", "/kaggle/working/hf_cache")
 
     if config.wandb_enabled:
+        wandb_config = dict(config.__dict__)
         wandb.init(
             project=config.wandb_project_name,
+            entity=config.wandb_entity,
             name=config.wandb_experiment_name,
-            config=config.__dict__,
+            group=config.wandb_group,
+            job_type=config.wandb_job_type,
+            tags=config.wandb_tags,
+            notes=config.wandb_notes,
+            config=wandb_config,
         )
     else:
         os.environ["WANDB_DISABLED"] = "true"
