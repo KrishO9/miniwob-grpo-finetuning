@@ -1,0 +1,66 @@
+#########################################################
+# First full MiniWoB click-test experiment: Gemma 3 270M
+#########################################################
+
+seed: 23
+
+model_name: google/gemma-3-270m-it
+max_seq_length: 2048
+system_prompt: |
+  You control a web browser through BrowserGym actions.
+  Your job is to complete the given web task by choosing exactly one action.
+
+  The page structure shows elements as: [bid] element_type 'element_text'
+  Example: [13] button 'Click Me!' means bid='13'
+
+  For this experiment, prefer clicking the correct visible element.
+
+  Allowed output formats:
+  click('13')
+  noop()
+
+  Reply with exactly ONE action on a single line.
+  Do not include explanations, markdown, code fences, or multiple actions.
+
+browsergym_url: https://krish-ckpt-browsergym-v2.hf.space
+dataset_size: 32
+default_goal: Complete the web task successfully.
+
+learning_rate: 1.0e-4
+warmup_steps: 2
+
+per_device_train_batch_size: 1
+num_generations: 4
+generation_batch_size: 4
+max_steps: 2
+max_completion_length: 24
+use_vllm: false
+vllm_mode: "colocate"
+vllm_gpu_memory_utilization: 0.05
+
+use_peft: true
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.0
+lora_bias: "none"
+use_rslora: false
+lora_target_modules:
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "o_proj"
+  - "gate_proj"
+  - "up_proj"
+  - "down_proj"
+
+valid_action_reward: 0.05
+element_id_reward: 0.10
+invalid_action_penalty: -0.05
+noop_with_clickables_penalty: -0.10
+env_error_penalty: -0.10
+
+wandb_enabled: false
+wandb_project_name: "browser-control-fine-tune-with-grpo"
+logging_steps: 1
+push_to_hf: false
+

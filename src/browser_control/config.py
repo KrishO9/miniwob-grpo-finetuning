@@ -63,6 +63,14 @@ class FineTuningConfig(BaseSettings):
         "down_proj",
     ]
 
+    # Rollout diagnostics and shaped reward for sparse MiniWoB tasks
+    rollout_log_path: Optional[str] = None
+    valid_action_reward: float = 0.05
+    element_id_reward: float = 0.10
+    invalid_action_penalty: float = -0.05
+    noop_with_clickables_penalty: float = -0.10
+    env_error_penalty: float = -0.10
+
     # max_steps: int = 10000  # increase!
     # save_steps: int = 1000  # increase!
     # eval_steps: int = 1000  # increase!

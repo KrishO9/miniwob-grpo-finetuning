@@ -1,5 +1,9 @@
 import os
+import json
+import re
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 
 from datasets import Dataset
 from peft import LoraConfig
@@ -14,12 +18,28 @@ from .config import FineTuningConfig
 from .paths import get_path_model_checkpoints
 
 
+ACTION_RE = re.compile(
+    r"^(?P<name>click|noop|fill|keyboard_type|keyboard_press)\((?P<args>.*)\)$"
+)
+BID_RE = re.compile(r"\[(\d+)\]")
+CLICKABLE_RE = re.compile(r"\[(\d+)\]\s+(button|link|input|textbox|combobox)", re.I)
+QUOTED_BID_RE = re.compile(r"""['"](?P<bid>\d+)['"]""")
+
+
+@dataclass
+class ParsedAction:
+    action_str: str
+    valid: bool
+    action_name: str
+    referenced_bid: str | None = None
+
+
 def rollout_func(
     prompts: list[str],
     trainer: GRPOTrainer,
     client: BrowserGymEnv,
-    system_prompt: str,
-    max_steps: int,
+    config: FineTuningConfig,
+    rollout_log_path: str,
 ) -> dict[str, list]:
     episode_prompt_ids: list[list[int]] = []
     episode_completion_ids: list[list[int]] = []
@@ -34,9 +54,9 @@ def rollout_func(
             trainer=trainer,
             env=client,
             tokenizer=trainer.processing_class,
-            system_prompt=system_prompt,
+            config=config,
             dataset_prompt=prompt_text,
-            max_steps=max_steps,
+            rollout_log_path=rollout_log_path,
         )
         episode_prompt_ids.append(episode["prompt_ids"])
         episode_completion_ids.append(episode["completion_ids"])
@@ -55,9 +75,9 @@ def rollout_once(
     trainer: GRPOTrainer,
     env: BrowserGymEnv,
     tokenizer: AutoTokenizer,
-    system_prompt: str,
+    config: FineTuningConfig,
     dataset_prompt: str,
-    max_steps: int,
+    rollout_log_path: str,
 ) -> dict[str, list]:
     from trl.experimental.openenv import generate_rollout_completions
 
@@ -73,7 +93,7 @@ def rollout_once(
     step_rewards: list[float] = []
     completion_rewards: list[float] = []
 
-    for step_num in range(max_steps):
+    for step_num in range(config.max_steps):
         if result.done:
             break
 
@@ -83,7 +103,7 @@ def rollout_once(
 
         user_prompt = make_user_prompt(goal, step_num, axtree, error)
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": config.system_prompt},
             {"role": "user", "content": user_prompt},
         ]
         prompt_text = tokenizer.apply_chat_template(
@@ -102,21 +122,45 @@ def rollout_once(
             skip_special_tokens=True,
         )
 
-        action_str = parse_action(completion_text)
+        parsed_action = parse_action(completion_text)
+        action_str = parsed_action.action_str
         print(f"Step {step_num + 1}: {action_str}")
 
         result = env.step(BrowserGymAction(action_str=action_str))
         observation = result.observation
 
         step_reward = float(result.reward or 0.0)
+        shaped_reward = compute_shaped_reward(
+            env_reward=step_reward,
+            parsed_action=parsed_action,
+            axtree=axtree,
+            last_action_error=observation.last_action_error,
+            config=config,
+        )
         step_rewards.append(step_reward)
 
-        if result.done and step_reward > 0:
-            completion_rewards.append(1.0)
-        elif result.done and step_reward == 0:
-            completion_rewards.append(0.0)
-        else:
-            completion_rewards.append(step_reward)
+        completion_rewards.append(shaped_reward)
+        append_rollout_log(
+            rollout_log_path,
+            {
+                "goal": goal,
+                "step_num": step_num + 1,
+                "raw_completion": completion_text,
+                "parsed_action": parsed_action.action_str,
+                "valid_action": parsed_action.valid,
+                "action_name": parsed_action.action_name,
+                "referenced_bid": parsed_action.referenced_bid,
+                "referenced_bid_exists": bid_exists(
+                    axtree, parsed_action.referenced_bid
+                ),
+                "env_reward": step_reward,
+                "shaped_reward": shaped_reward,
+                "done": bool(result.done),
+                "env_error": observation.error,
+                "last_action_error": observation.last_action_error,
+                "axtree_txt": axtree,
+            },
+        )
 
     final_reward = completion_rewards[-1] if completion_rewards else 0.0
 
@@ -147,7 +191,80 @@ def make_user_prompt(goal: str, step_num: int, axtree: str, error: str = "") -> 
     return "\n\n".join(prompt_parts)
 
 
-def parse_action(response_text: str) -> str:
+def parse_action(response_text: str) -> ParsedAction:
+    for raw_line in response_text.strip().split("\n"):
+        line = raw_line.strip().strip("`")
+        if not line:
+            continue
+        match = ACTION_RE.match(line)
+        if not match:
+            continue
+
+        action_name = match.group("name")
+        args = match.group("args").strip()
+        if action_name == "noop":
+            return ParsedAction("noop()", args == "", "noop")
+
+        bid_match = QUOTED_BID_RE.search(args)
+        referenced_bid = bid_match.group("bid") if bid_match else None
+
+        if action_name == "click" and referenced_bid:
+            return ParsedAction(f"click('{referenced_bid}')", True, "click", referenced_bid)
+
+        if action_name == "fill" and referenced_bid:
+            return ParsedAction(line, True, "fill", referenced_bid)
+
+        if action_name in {"keyboard_type", "keyboard_press"} and args:
+            return ParsedAction(line, True, action_name)
+
+    return ParsedAction("noop()", False, "noop")
+
+
+def extract_bids(axtree: str) -> set[str]:
+    return set(BID_RE.findall(axtree or ""))
+
+
+def has_clickables(axtree: str) -> bool:
+    return bool(CLICKABLE_RE.search(axtree or ""))
+
+
+def bid_exists(axtree: str, bid: str | None) -> bool:
+    return bid is not None and bid in extract_bids(axtree)
+
+
+def compute_shaped_reward(
+    env_reward: float,
+    parsed_action: ParsedAction,
+    axtree: str,
+    last_action_error: bool,
+    config: FineTuningConfig,
+) -> float:
+    reward = env_reward
+
+    if parsed_action.valid:
+        reward += config.valid_action_reward
+    else:
+        reward += config.invalid_action_penalty
+
+    if bid_exists(axtree, parsed_action.referenced_bid):
+        reward += config.element_id_reward
+
+    if parsed_action.action_name == "noop" and has_clickables(axtree):
+        reward += config.noop_with_clickables_penalty
+
+    if last_action_error:
+        reward += config.env_error_penalty
+
+    return float(reward)
+
+
+def append_rollout_log(path: str, record: dict) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+
+def parse_action_legacy(response_text: str) -> str:
     for line in response_text.strip().split("\n"):
         line = line.strip()
         if "(" in line and ")" in line:
@@ -195,6 +312,8 @@ def fine_tune_impl(config: FineTuningConfig) -> None:
 
     dataset = Dataset.from_dict({"prompt": [config.default_goal] * config.dataset_size})
     output_dir = get_path_model_checkpoints(config.wandb_experiment_name)
+    rollout_log_path = config.rollout_log_path or str(Path(output_dir) / "rollouts.jsonl")
+    print(f"Writing rollout logs to {rollout_log_path}")
 
     grpo_config = GRPOConfig(
         max_steps=config.dataset_size,
@@ -224,8 +343,8 @@ def fine_tune_impl(config: FineTuningConfig) -> None:
             prompts=prompts,
             trainer=trainer,
             client=client,
-            system_prompt=config.system_prompt,
-            max_steps=config.max_steps,
+            config=config,
+            rollout_log_path=rollout_log_path,
         ),
     )
 
