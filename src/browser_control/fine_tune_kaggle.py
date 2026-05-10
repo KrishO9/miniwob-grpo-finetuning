@@ -25,6 +25,8 @@ BID_RE = re.compile(r"\[(\d+)\]")
 CLICKABLE_RE = re.compile(r"\[(\d+)\]\s+(button|link|input|textbox|combobox)", re.I)
 CLICK_ARGS_RE = re.compile(r"""^\s*(?:['"]?(?P<bid>\d+)['"]?|id\s*=\s*['"]?(?P<id_bid>\d+)['"]?)\s*$""")
 
+LAST_ROLLOUT_SHAPED_REWARDS: list[float] = []
+
 
 @dataclass
 class ParsedAction:
@@ -72,6 +74,9 @@ def rollout_func(
             episode_completion_ids.append(episode["completion_ids"])
             episode_logprobs.append(episode["logprobs"])
             shaped_rewards.append(episode["shaped_reward"])
+
+    global LAST_ROLLOUT_SHAPED_REWARDS
+    LAST_ROLLOUT_SHAPED_REWARDS = shaped_rewards
 
     return {
         "prompt_ids": episode_prompt_ids,
@@ -291,10 +296,13 @@ def parse_action_legacy(response_text: str) -> str:
 def reward_completion(completions: list[str], **kwargs) -> list[float]:
     rewards = kwargs.get("shaped_reward") if kwargs else None
     if rewards is None:
+        rewards = LAST_ROLLOUT_SHAPED_REWARDS
+    if len(rewards) != len(completions):
         keys = sorted(kwargs.keys()) if kwargs else []
         raise RuntimeError(
-            "rollout_func did not forward shaped_reward to reward_completion. "
-            f"Available kwargs: {keys}"
+            "reward count does not match completion count. "
+            f"rewards={len(rewards)} completions={len(completions)} "
+            f"kwargs={keys}"
         )
     return [float(r) for r in rewards]
 
