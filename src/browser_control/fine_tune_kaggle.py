@@ -7,7 +7,6 @@ from pathlib import Path
 
 from datasets import Dataset
 from peft import LoraConfig
-from transformers import AutoTokenizer
 from trl import GRPOConfig
 from trl import GRPOTrainer
 import wandb
@@ -25,8 +24,6 @@ BID_RE = re.compile(r"\[(\d+)\]")
 CLICKABLE_RE = re.compile(r"\[(\d+)\]\s+(button|link|input|textbox|combobox)", re.I)
 CLICK_ARGS_RE = re.compile(r"""^\s*(?:['"]?(?P<bid>\d+)['"]?|id\s*=\s*['"]?(?P<id_bid>\d+)['"]?)\s*$""")
 
-LAST_ROLLOUT_SHAPED_REWARDS: list[float] = []
-
 
 @dataclass
 class ParsedAction:
@@ -34,162 +31,6 @@ class ParsedAction:
     valid: bool
     action_name: str
     referenced_bid: str | None = None
-
-
-def rollout_func(
-    prompts: list[str],
-    trainer: GRPOTrainer,
-    client: BrowserGymEnv,
-    config: FineTuningConfig,
-    rollout_log_path: str,
-) -> dict[str, list]:
-    episode_prompt_ids: list[list[int]] = []
-    episode_completion_ids: list[list[int]] = []
-    episode_logprobs: list[list[float]] = []
-    shaped_rewards: list[float] = []
-
-    print(
-        "\n[DEBUG] rollout_func called with "
-        f"{len(prompts)} prompts x {config.num_generations} generations"
-    )
-
-    for i, prompt_text in enumerate(prompts):
-        for generation_idx in range(config.num_generations):
-            print(
-                "[DEBUG] Processing prompt "
-                f"{i + 1}/{len(prompts)}, generation "
-                f"{generation_idx + 1}/{config.num_generations}"
-            )
-            episode = rollout_once(
-                trainer=trainer,
-                env=client,
-                tokenizer=trainer.processing_class,
-                config=config,
-                dataset_prompt=prompt_text,
-                rollout_log_path=rollout_log_path,
-                prompt_index=i,
-                generation_index=generation_idx,
-            )
-            episode_prompt_ids.append(episode["prompt_ids"])
-            episode_completion_ids.append(episode["completion_ids"])
-            episode_logprobs.append(episode["logprobs"])
-            shaped_rewards.append(episode["shaped_reward"])
-
-    global LAST_ROLLOUT_SHAPED_REWARDS
-    LAST_ROLLOUT_SHAPED_REWARDS = shaped_rewards
-
-    return {
-        "prompt_ids": episode_prompt_ids,
-        "completion_ids": episode_completion_ids,
-        "logprobs": episode_logprobs,
-        "shaped_reward": shaped_rewards,
-    }
-
-
-def rollout_once(
-    trainer: GRPOTrainer,
-    env: BrowserGymEnv,
-    tokenizer: AutoTokenizer,
-    config: FineTuningConfig,
-    dataset_prompt: str,
-    rollout_log_path: str,
-    prompt_index: int,
-    generation_index: int,
-) -> dict[str, list]:
-    from trl.experimental.openenv import generate_rollout_completions
-
-    result = env.reset()
-    observation = result.observation
-
-    print("Goal: ", observation.goal)
-    print("axtree_txt: ", observation.axtree_txt)
-
-    prompt_ids: list[int] = []
-    completion_ids: list[int] = []
-    logprobs: list[float] = []
-    step_rewards: list[float] = []
-    completion_rewards: list[float] = []
-
-    for step_num in range(config.max_steps):
-        if result.done:
-            break
-
-        goal = observation.goal or dataset_prompt
-        axtree = observation.axtree_txt or ""
-        error = observation.error if observation.last_action_error else ""
-
-        user_prompt = make_user_prompt(goal, step_num, axtree, error)
-        messages = [
-            {"role": "system", "content": config.system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        prompt_text = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-
-        rollout_outputs = generate_rollout_completions(trainer, [prompt_text])[0]
-        prompt_ids.extend(rollout_outputs["prompt_ids"])
-        completion_ids.extend(rollout_outputs["completion_ids"])
-        logprobs.extend(rollout_outputs["logprobs"])
-
-        completion_text = rollout_outputs.get("text") or tokenizer.decode(
-            rollout_outputs["completion_ids"],
-            skip_special_tokens=True,
-        )
-
-        parsed_action = parse_action(completion_text)
-        action_str = parsed_action.action_str
-        print(f"Step {step_num + 1}: {action_str}")
-
-        result = env.step(BrowserGymAction(action_str=action_str))
-        observation = result.observation
-
-        step_reward = float(result.reward or 0.0)
-        shaped_reward = compute_shaped_reward(
-            env_reward=step_reward,
-            parsed_action=parsed_action,
-            axtree=axtree,
-            last_action_error=observation.last_action_error,
-            config=config,
-        )
-        step_rewards.append(step_reward)
-
-        completion_rewards.append(shaped_reward)
-        append_rollout_log(
-            rollout_log_path,
-            {
-                "prompt_index": prompt_index,
-                "generation_index": generation_index,
-                "goal": goal,
-                "step_num": step_num + 1,
-                "raw_completion": completion_text,
-                "parsed_action": parsed_action.action_str,
-                "valid_action": parsed_action.valid,
-                "action_name": parsed_action.action_name,
-                "referenced_bid": parsed_action.referenced_bid,
-                "referenced_bid_exists": bid_exists(
-                    axtree, parsed_action.referenced_bid
-                ),
-                "env_reward": step_reward,
-                "shaped_reward": shaped_reward,
-                "done": bool(result.done),
-                "env_error": observation.error,
-                "last_action_error": observation.last_action_error,
-                "axtree_txt": axtree,
-            },
-        )
-
-    final_reward = completion_rewards[-1] if completion_rewards else 0.0
-
-    return {
-        "prompt_ids": prompt_ids,
-        "completion_ids": completion_ids,
-        "logprobs": logprobs,
-        "step_rewards": step_rewards,
-        "shaped_reward": final_reward,
-    }
 
 
 def make_user_prompt(goal: str, step_num: int, axtree: str, error: str = "") -> str:
@@ -285,6 +126,35 @@ def append_rollout_log(path: str, record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=True) + "\n")
 
 
+def build_training_prompt(config: FineTuningConfig, goal: str, axtree: str) -> str:
+    return "\n\n".join(
+        [
+            config.system_prompt.strip(),
+            make_user_prompt(goal, step_num=0, axtree=axtree, error=""),
+        ]
+    )
+
+
+def completion_to_text(completion: object) -> str:
+    if isinstance(completion, str):
+        return completion
+    if isinstance(completion, dict):
+        content = completion.get("content")
+        return content if isinstance(content, str) else json.dumps(completion, ensure_ascii=True)
+    if isinstance(completion, list):
+        parts: list[str] = []
+        for item in completion:
+            if isinstance(item, dict):
+                content = item.get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+            elif isinstance(item, str):
+                parts.append(item)
+        if parts:
+            return "\n".join(parts)
+    return str(completion)
+
+
 def parse_action_legacy(response_text: str) -> str:
     for line in response_text.strip().split("\n"):
         line = line.strip()
@@ -293,18 +163,60 @@ def parse_action_legacy(response_text: str) -> str:
     return "noop()"
 
 
-def reward_completion(completions: list[str], **kwargs) -> list[float]:
-    rewards = kwargs.get("shaped_reward") if kwargs else None
-    if rewards is None:
-        rewards = LAST_ROLLOUT_SHAPED_REWARDS
-    if len(rewards) != len(completions):
-        keys = sorted(kwargs.keys()) if kwargs else []
-        raise RuntimeError(
-            "reward count does not match completion count. "
-            f"rewards={len(rewards)} completions={len(completions)} "
-            f"kwargs={keys}"
-        )
-    return [float(r) for r in rewards]
+def make_reward_completion(
+    client: BrowserGymEnv,
+    config: FineTuningConfig,
+    rollout_log_path: str,
+):
+    def reward_completion(prompts: list[str], completions: list[object], **kwargs) -> list[float]:
+        rewards: list[float] = []
+
+        for index, completion in enumerate(completions):
+            # For the current MiniWoB click-test experiment, score one fresh episode per completion.
+            reset_result = client.reset()
+            reset_observation = reset_result.observation
+            goal = reset_observation.goal or config.default_goal
+            axtree = reset_observation.axtree_txt or ""
+            completion_text = completion_to_text(completion)
+            parsed_action = parse_action(completion_text)
+
+            step_result = client.step(BrowserGymAction(action_str=parsed_action.action_str))
+            step_observation = step_result.observation
+
+            env_reward = float(step_result.reward or 0.0)
+            shaped_reward = compute_shaped_reward(
+                env_reward=env_reward,
+                parsed_action=parsed_action,
+                axtree=axtree,
+                last_action_error=step_observation.last_action_error,
+                config=config,
+            )
+            rewards.append(shaped_reward)
+
+            append_rollout_log(
+                rollout_log_path,
+                {
+                    "prompt_index": index,
+                    "goal": goal,
+                    "prompt": prompts[index] if index < len(prompts) else None,
+                    "raw_completion": completion_text,
+                    "parsed_action": parsed_action.action_str,
+                    "valid_action": parsed_action.valid,
+                    "action_name": parsed_action.action_name,
+                    "referenced_bid": parsed_action.referenced_bid,
+                    "referenced_bid_exists": bid_exists(axtree, parsed_action.referenced_bid),
+                    "env_reward": env_reward,
+                    "shaped_reward": shaped_reward,
+                    "done": bool(step_result.done),
+                    "env_error": step_observation.error,
+                    "last_action_error": step_observation.last_action_error,
+                    "axtree_txt": axtree,
+                },
+            )
+
+        return rewards
+
+    return reward_completion
 
 
 def create_peft_config(config: FineTuningConfig) -> LoraConfig | None:
@@ -344,7 +256,14 @@ def fine_tune_impl(config: FineTuningConfig) -> None:
     print(f"Initializing BrowserGym client at {config.browsergym_url}")
     client = BrowserGymEnv(base_url=config.browsergym_url)
 
-    dataset = Dataset.from_dict({"prompt": [config.default_goal] * config.dataset_size})
+    initial_reset = client.reset()
+    initial_observation = initial_reset.observation
+    initial_goal = initial_observation.goal or config.default_goal
+    initial_axtree = initial_observation.axtree_txt or ""
+    print(f"Initial goal: {initial_goal}")
+    training_prompt = build_training_prompt(config, initial_goal, initial_axtree)
+
+    dataset = Dataset.from_dict({"prompt": [training_prompt] * config.dataset_size})
     output_dir = get_path_model_checkpoints(config.wandb_experiment_name)
     rollout_log_path = config.rollout_log_path or str(Path(output_dir) / "rollouts.jsonl")
     print(f"Writing rollout logs to {rollout_log_path}")
@@ -366,6 +285,11 @@ def fine_tune_impl(config: FineTuningConfig) -> None:
     )
 
     peft_config = create_peft_config(config)
+    reward_completion = make_reward_completion(
+        client=client,
+        config=config,
+        rollout_log_path=rollout_log_path,
+    )
 
     trainer = GRPOTrainer(
         model=config.model_name,
@@ -373,13 +297,6 @@ def fine_tune_impl(config: FineTuningConfig) -> None:
         train_dataset=dataset,
         args=grpo_config,
         peft_config=peft_config,
-        rollout_func=lambda prompts, trainer: rollout_func(
-            prompts=prompts,
-            trainer=trainer,
-            client=client,
-            config=config,
-            rollout_log_path=rollout_log_path,
-        ),
     )
 
     trainer.train()
