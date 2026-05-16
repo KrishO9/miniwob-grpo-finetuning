@@ -1,0 +1,63 @@
+phase_a_click:
+  description: "Single-click grounding tasks with AX-tree-visible targets."
+  max_steps: 1
+  teacher: rule_oracle
+  target_examples_per_task: 100
+  tasks:
+    - click-test
+    - click-test-2
+    - click-button
+    - click-link
+    - click-dialog
+    - click-dialog-2
+    - click-option
+    - click-checkboxes
+    - click-tab
+    - click-menu
+
+phase_b_text:
+  description: "Text-entry and field-grounding tasks."
+  max_steps: 3
+  teacher: rule_oracle_or_qwen_coder
+  target_examples_per_task: 100
+  tasks:
+    - enter-text
+    - enter-text-2
+    - enter-password
+    - enter-date
+    - enter-time
+    - focus-text
+    - focus-text-2
+    - login-user
+    - use-autocomplete-nodelay
+
+phase_c_forms:
+  description: "Form, menu, date, and layout variation tasks."
+  max_steps: 5
+  teacher: qwen_coder
+  target_examples_per_task: 100
+  tasks:
+    - choose-list
+    - choose-date-easy
+    - choose-date-medium
+    - choose-date-nodelay
+    - book-flight-nodelay
+    - flight.Alaska
+    - flight.Alaska-auto
+    - multi-layouts
+    - multi-orderings
+    - form-sequence
+
+phase_d_multistep:
+  description: "Short multi-step tasks for later trajectory collection."
+  max_steps: 8
+  teacher: qwen_coder
+  target_traces_per_task: 50
+  tasks:
+    - email-inbox-noscroll
+    - email-inbox-delete
+    - email-inbox-forward
+    - email-inbox-reply
+    - email-inbox-important
+    - click-tab-2-easy
+    - click-tab-2-medium
