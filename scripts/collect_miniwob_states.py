@@ -4,6 +4,7 @@ import argparse
 from collections import Counter
 import os
 from pathlib import Path
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -46,21 +47,27 @@ def collect_states(
     out_path: str | Path,
     errors_path: str | Path,
     max_per_task: int | None,
+    retries: int,
+    retry_sleep_seconds: float,
 ) -> None:
     seen_state_hashes: set[str] = set()
     task_counts: Counter[str] = Counter()
     duplicate_counts: Counter[str] = Counter()
     error_counts: Counter[str] = Counter()
 
-    with BrowserGymEnv(base_url=browsergym_url) as env:
-        for task_name in bucket["tasks"]:
-            emitted_for_task = 0
-            for seed in seeds:
-                if max_per_task is not None and emitted_for_task >= max_per_task:
-                    break
+    for task_name in bucket["tasks"]:
+        emitted_for_task = 0
+        for seed in seeds:
+            if max_per_task is not None and emitted_for_task >= max_per_task:
+                break
 
+            last_error = ""
+            for attempt in range(retries + 1):
                 try:
-                    result = env.reset(seed=seed, task_name=task_name)
+                    # Use a short-lived websocket so one dead connection cannot poison
+                    # the rest of a long collection run.
+                    with BrowserGymEnv(base_url=browsergym_url) as env:
+                        result = env.reset(seed=seed, task_name=task_name)
                     episode_id = f"{task_name}_seed_{seed}_{uuid4().hex[:8]}"
                     record = RawStateRecord.from_observation(
                         task_name=task_name,
@@ -79,7 +86,13 @@ def collect_states(
                     append_jsonl(out_path, record.to_dict())
                     task_counts[task_name] += 1
                     emitted_for_task += 1
+                    break
                 except Exception as exc:  # noqa: BLE001 - collection should continue
+                    last_error = str(exc)
+                    if attempt < retries:
+                        time.sleep(retry_sleep_seconds)
+                        continue
+
                     error_counts[task_name] += 1
                     append_jsonl(
                         errors_path,
@@ -88,7 +101,8 @@ def collect_states(
                             "task_name": task_name,
                             "task_bucket": bucket_name,
                             "seed": seed,
-                            "error": str(exc),
+                            "attempts": retries + 1,
+                            "error": last_error,
                         },
                     )
 
@@ -141,6 +155,18 @@ def main() -> None:
         default=None,
         help="Optional cap on kept unique states per task.",
     )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="Retries per task/seed after reconnecting the websocket.",
+    )
+    parser.add_argument(
+        "--retry-sleep-seconds",
+        type=float,
+        default=1.0,
+        help="Sleep between retry attempts.",
+    )
     args = parser.parse_args()
 
     bucket = load_bucket(args.task_buckets, args.bucket)
@@ -156,6 +182,8 @@ def main() -> None:
         out_path=out_path,
         errors_path=errors_path,
         max_per_task=args.max_per_task,
+        retries=args.retries,
+        retry_sleep_seconds=args.retry_sleep_seconds,
     )
 
 

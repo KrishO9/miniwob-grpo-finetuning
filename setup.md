@@ -356,7 +356,258 @@ There is an evaluation script at [src/browser_control/evaluate.py](./src/browser
 
 You should fix that before relying on the evaluation script.
 
-## 4. Running Your Own BrowserGym Space
+## 4. Kaggle SFT Dataset Creation
+
+This section is for the SFT data pipeline, before teacher annotation. The goal is to collect raw MiniWoB states from the BrowserGym Space, verify that each task produces a valid `goal` and `axtree_txt`, then use the resulting JSONL files as input for a later teacher-labeling pass.
+
+Prerequisites:
+
+- Your BrowserGym HF Space is built and healthy.
+- The Space includes the task override patch so `reset(task_name=...)` can switch MiniWoB tasks.
+- Kaggle internet is enabled.
+- You are running commands from the cloned `miniwob-grpo-finetuning` repo.
+
+### 4.1 Clone and install on Kaggle
+
+Run this in a Kaggle notebook cell:
+
+```bash
+cd /kaggle/working
+git clone https://github.com/KrishO9/miniwob-grpo-finetuning.git
+cd /kaggle/working/miniwob-grpo-finetuning
+
+python -m pip install --upgrade pip
+pip install uv
+uv sync
+```
+
+If the repo already exists:
+
+```bash
+cd /kaggle/working/miniwob-grpo-finetuning
+git pull
+uv sync
+```
+
+Use the project virtualenv explicitly. Do not rely on notebook-kernel activation:
+
+```bash
+.venv/bin/python --version
+.venv/bin/python -c "import browser_control; print('browser_control import ok')"
+```
+
+### 4.2 Set the BrowserGym Space URL
+
+```bash
+export BROWSERGYM_URL="https://krish-ckpt-browsergym-v2.hf.space"
+```
+
+Check that Kaggle can reach the Space:
+
+```bash
+.venv/bin/python - <<'PY'
+import os
+import requests
+
+base = os.environ["BROWSERGYM_URL"].rstrip("/")
+for path in ["/health", "/web", "/docs"]:
+    r = requests.get(base + path, timeout=30)
+    print(path, r.status_code, r.text[:160].replace("\n", " "))
+PY
+```
+
+Expected:
+
+- `/health` returns `200` and a healthy JSON response.
+- `/web` returns `200`.
+- `/docs` returns `200`.
+
+### 4.3 Smoke-test raw state collection
+
+Start with only a few seeds from the simple click bucket:
+
+```bash
+mkdir -p data/raw_states
+
+PYTHONPATH=src .venv/bin/python scripts/collect_miniwob_states.py \
+  --browsergym-url "$BROWSERGYM_URL" \
+  --bucket phase_a_click \
+  --seeds 0:3 \
+  --max-per-task 2 \
+  --out data/raw_states/smoke_phase_a_click.jsonl \
+  --errors-out data/raw_states/smoke_phase_a_click_errors.jsonl
+```
+
+Inspect the first records:
+
+```bash
+head -n 3 data/raw_states/smoke_phase_a_click.jsonl
+cat data/raw_states/smoke_phase_a_click_errors.jsonl
+```
+
+Validate the smoke file:
+
+```bash
+PYTHONPATH=src .venv/bin/python - <<'PY'
+import json
+from collections import Counter
+from pathlib import Path
+
+path = Path("data/raw_states/smoke_phase_a_click.jsonl")
+rows = [json.loads(line) for line in path.open() if line.strip()]
+
+print("rows", len(rows))
+print("tasks", Counter(row["task_name"] for row in rows))
+print("empty_goal", sum(not row.get("goal") for row in rows))
+print("empty_axtree", sum(not row.get("axtree_txt") for row in rows))
+print("unique_states", len({row["state_hash"] for row in rows}))
+
+for row in rows[:3]:
+    print("---")
+    print("task:", row["task_name"])
+    print("goal:", row["goal"])
+    print("axtree:", row["axtree_txt"][:400].replace("\n", "\\n"))
+PY
+```
+
+Pass criteria before moving forward:
+
+- `rows` is greater than `0`.
+- At least several tasks are represented.
+- `empty_goal` is `0`.
+- `empty_axtree` is `0`.
+- Errors are either empty or clearly task-specific.
+
+If most tasks fail, do not start annotation. Check whether the HF Space has rebuilt with the latest `browsergym-v2` task override patch.
+
+### 4.4 Collect each planned task bucket
+
+After the smoke test passes, collect the current buckets separately. Keeping buckets separate makes quality checks and teacher strategy easier.
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/collect_miniwob_states.py \
+  --browsergym-url "$BROWSERGYM_URL" \
+  --bucket phase_a_click \
+  --seeds 0:100 \
+  --max-per-task 100 \
+  --out data/raw_states/phase_a_click.jsonl \
+  --errors-out data/raw_states/phase_a_click_errors.jsonl
+```
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/collect_miniwob_states.py \
+  --browsergym-url "$BROWSERGYM_URL" \
+  --bucket phase_b_text \
+  --seeds 0:100 \
+  --max-per-task 100 \
+  --out data/raw_states/phase_b_text.jsonl \
+  --errors-out data/raw_states/phase_b_text_errors.jsonl
+```
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/collect_miniwob_states.py \
+  --browsergym-url "$BROWSERGYM_URL" \
+  --bucket phase_c_forms \
+  --seeds 0:100 \
+  --max-per-task 100 \
+  --out data/raw_states/phase_c_forms.jsonl \
+  --errors-out data/raw_states/phase_c_forms_errors.jsonl
+```
+
+Collect multi-step tasks later, after the single-step and short form buckets are stable:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/collect_miniwob_states.py \
+  --browsergym-url "$BROWSERGYM_URL" \
+  --bucket phase_d_multistep \
+  --seeds 0:50 \
+  --max-per-task 50 \
+  --out data/raw_states/phase_d_multistep.jsonl \
+  --errors-out data/raw_states/phase_d_multistep_errors.jsonl
+```
+
+### 4.5 Validate all collected raw states
+
+Run this summary after each bucket:
+
+```bash
+PYTHONPATH=src .venv/bin/python - <<'PY'
+import json
+from collections import Counter
+from pathlib import Path
+
+for path in sorted(Path("data/raw_states").glob("phase_*.jsonl")):
+    if path.name.endswith("_errors.jsonl"):
+        continue
+    rows = [json.loads(line) for line in path.open() if line.strip()]
+    task_counts = Counter(row["task_name"] for row in rows)
+    empty_goal = sum(not row.get("goal") for row in rows)
+    empty_axtree = sum(not row.get("axtree_txt") for row in rows)
+    unique_states = len({row["state_hash"] for row in rows})
+    duplicate_rate = 0 if not rows else 1 - (unique_states / len(rows))
+
+    print("=" * 80)
+    print(path)
+    print("rows:", len(rows))
+    print("tasks:", len(task_counts), task_counts)
+    print("empty_goal:", empty_goal)
+    print("empty_axtree:", empty_axtree)
+    print("unique_states:", unique_states)
+    print("duplicate_rate:", round(duplicate_rate, 4))
+PY
+```
+
+Inspect errors:
+
+```bash
+for f in data/raw_states/*_errors.jsonl; do
+  echo "===== $f"
+  head -n 20 "$f"
+done
+```
+
+Quality gate before teacher annotation:
+
+- No bucket has `empty_goal > 0`.
+- No bucket has `empty_axtree > 0`.
+- Each intended task has at least some collected examples.
+- Failed tasks are either removed from `data/task_registry/task_buckets.yaml` or fixed in the BrowserGym Space.
+- Duplicate rate is understood. A high duplicate rate can be acceptable for deterministic tasks, but it means seeds are not producing much variation.
+
+### 4.6 Preserve the raw dataset from Kaggle
+
+Kaggle working storage is temporary. Archive the raw states before closing the session:
+
+```bash
+tar -czf miniwob_raw_states_$(date +%Y%m%d_%H%M%S).tar.gz data/raw_states
+ls -lh *.tar.gz
+```
+
+If you want to push the collected data to a dataset repo, use a Hugging Face dataset repository rather than committing large JSONL files to the code repo.
+
+Example:
+
+```bash
+.venv/bin/python -m pip install huggingface_hub
+hf auth login
+hf repo create your-username/miniwob-sft-raw-states --type dataset
+```
+
+Then upload the archive or JSONL files from the Kaggle UI or with the Hub CLI after verifying the data quality.
+
+### 4.7 What comes after raw state collection
+
+Do not run SFT directly on `data/raw_states/*.jsonl`. These files do not contain target actions yet.
+
+The next pipeline stages are:
+
+1. Teacher annotation: produce one or more candidate actions per raw state.
+2. Environment verification: replay teacher actions against BrowserGym and keep only successful or high-confidence labels.
+3. SFT formatting: convert verified labels into prompt/completion training records.
+4. SFT training: train Qwen/Gemma on the verified prompt-action records.
+5. Evaluation: measure task success on held-out seeds and held-out tasks before any GRPO run.
+
+## 5. Running Your Own BrowserGym Space
 
 If you want your own environment service instead of the public Space, the practical workflow is:
 
@@ -369,7 +620,7 @@ If you want your own environment service instead of the public Space, the practi
 
 The exact server implementation is not vendored inside `examples/browser-control`; `BrowserGymEnv` is imported from the OpenEnv stack, not implemented locally in this repo.
 
-## 5. Suggested End-to-End First Run
+## 6. Suggested End-to-End First Run
 
 ### Minimal first run
 
@@ -398,7 +649,7 @@ uv run modal run -m src.browser_control.fine_tune --config-file-name your_debug_
 4. Increase `num_generations`
 5. Try a second model config such as [configs/functiongemma_270m.yaml](./configs/functiongemma_270m.yaml)
 
-## 6. Known Issues In This Example
+## 7. Known Issues In This Example
 
 - README command mismatch: it says `make run`, but the Makefile target is `make fine-tune`
 - Evaluation config mismatch: `lfm2_350m_debugging.yaml` is referenced, but only `lfm2_350m_debug.yaml` exists
@@ -406,7 +657,7 @@ uv run modal run -m src.browser_control.fine_tune --config-file-name your_debug_
 - `seed`, `max_seq_length`, and `resume_from_checkpoint` exist in config but are not wired into the trainer logic yet
 - The code is text-only right now. It uses `observation.axtree_txt`, not screenshots, during training
 
-## 7. External References
+## 8. External References
 
 - Modal token docs: <https://modal.com/docs/reference/cli/token>
 - Modal run docs: <https://modal.com/docs/reference/cli/run>
